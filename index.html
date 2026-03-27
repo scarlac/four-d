@@ -72,6 +72,34 @@
             font-size: 12px;
             pointer-events: none;
         }
+
+        #w-indicator {
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            width: 120px;
+            height: 140px;
+            background: rgba(0, 0, 0, 0.5);
+            border: 1px solid rgba(255, 255, 0, 0.3);
+            border-radius: 8px;
+            pointer-events: none;
+            z-index: 100;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+
+        #w-canvas {
+            width: 120px;
+            height: 120px;
+        }
+
+        #w-label {
+            color: #ff0;
+            font-size: 11px;
+            font-family: 'Courier New', monospace;
+            margin-top: 2px;
+        }
     </style>
 </head>
 
@@ -86,6 +114,12 @@
     <div id="crosshair"></div>
     <div id="hint">Click to capture mouse | WASD: Move | Space/CTRL: Up/Down | Q/E: W-Move | Shift+Q/E: W-Rotate | R:
         Reset</div>
+    
+    <!-- W Axis Indicator Widget -->
+    <div id="w-indicator">
+        <canvas id="w-canvas" width="120" height="120"></canvas>
+        <div id="w-label">W Axis</div>
+    </div>
 
     <!-- Vertex Shader: 4D to 2D projection -->
     <script id="vs" type="x-shader/x-vertex">
@@ -98,10 +132,10 @@
         uniform vec4 uCameraPos;
         uniform mat4 uModelMatrix;
         uniform float uRotation4D;  // 4D rotation angle
+        uniform float uObjectW;     // Object's W position
         
         varying vec3 vColor;
         varying vec3 vNormal;
-        varying float vWDist;
         
         // 4D rotation in YW plane
         vec4 rotate4D_YW(vec4 p, float angle) {
@@ -117,6 +151,7 @@
         
         void main() {
             vec4 worldPos = uModelMatrix * vec4(aPosition, 1.0);
+            worldPos.w = uObjectW;  // Set the object's W position
             
             // 4D to 3D perspective projection with cross-section
             vec4 camRel = worldPos - uCameraPos;
@@ -126,7 +161,6 @@
             
             // W distance for cross-section visibility
             float wDist = abs(camRel.w);
-            vWDist = wDist;
             
             // Cross-section threshold - objects outside this band are invisible
             float wThreshold = 2.0;
@@ -165,14 +199,8 @@
         
         varying vec3 vColor;
         varying vec3 vNormal;
-        varying float vWDist;
         
         void main() {
-            // Cross-section fade: objects fade as they approach the W threshold
-            float wThreshold = 2.0;
-            float fadeStart = 1.5;
-            float alpha = 1.0 - smoothstep(fadeStart, wThreshold, vWDist);
-            
             vec3 normal = normalize(vNormal);
             vec3 lightDir = normalize(vec3(0.5, 1.0, 0.8));
             
@@ -180,7 +208,7 @@
             float ambient = 0.3;
             
             vec3 finalColor = vColor * (ambient + diff * 0.7);
-            gl_FragColor = vec4(finalColor, alpha);
+            gl_FragColor = vec4(finalColor, 1.0);
         }
     </script>
 
@@ -453,6 +481,33 @@
             return { positions, normals, colors, indices: null, isPoints: true, count };
         }
 
+        function createAxes(length) {
+            const positions = [];
+            const normals = [];
+            const colors = [];
+            const indices = [];
+
+            // X axis (red) - from origin along +X
+            positions.push(0, 0, 0, length, 0, 0);
+            normals.push(1, 0, 0, 1, 0, 0);
+            colors.push(1, 0.2, 0.2, 1, 0.2, 0.2);
+            indices.push(0, 1);
+
+            // Y axis (green) - from origin along +Y
+            positions.push(0, 0, 0, 0, length, 0);
+            normals.push(0, 1, 0, 0, 1, 0);
+            colors.push(0.2, 1, 0.2, 0.2, 1, 0.2);
+            indices.push(2, 3);
+
+            // Z axis (blue) - from origin along +Z
+            positions.push(0, 0, 0, 0, 0, length);
+            normals.push(0, 0, 1, 0, 0, 1);
+            colors.push(0.2, 0.2, 1, 0.2, 0.2, 1);
+            indices.push(4, 5);
+
+            return { positions, normals, colors, indices, isLines: true };
+        }
+
         // ============================================
         // WEBGL SETUP
         // ============================================
@@ -515,6 +570,7 @@
             cameraPos: gl.getUniformLocation(program, 'uCameraPos'),
             modelMatrix: gl.getUniformLocation(program, 'uModelMatrix'),
             rotation4D: gl.getUniformLocation(program, 'uRotation4D'),
+            objectW: gl.getUniformLocation(program, 'uObjectW'),
         };
 
         // ============================================
@@ -643,6 +699,37 @@
             isBox: true
         };
 
+        // Create axes indicators (X=red, Y=green, Z=blue)
+        const axesGeometry = createAxes(10);
+
+        const axesPosBuffer = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, axesPosBuffer);
+        gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(axesGeometry.positions), gl.STATIC_DRAW);
+
+        const axesNormBuffer = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, axesNormBuffer);
+        gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(axesGeometry.normals), gl.STATIC_DRAW);
+
+        const axesColorBuffer = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, axesColorBuffer);
+        gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(axesGeometry.colors), gl.STATIC_DRAW);
+
+        const axesIndexBuffer = gl.createBuffer();
+        gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, axesIndexBuffer);
+        gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array(axesGeometry.indices), gl.STATIC_DRAW);
+
+        const axesObject = {
+            position: new Vec4(0, 0, 0, 0),
+            rotation: 0,
+            posBuffer: axesPosBuffer,
+            normBuffer: axesNormBuffer,
+            colorBuffer: axesColorBuffer,
+            indexBuffer: axesIndexBuffer,
+            indexCount: axesGeometry.indices.length,
+            isPoints: false,
+            isLines: true
+        };
+
         // ============================================
         // CAMERA & INPUT
         // ============================================
@@ -654,7 +741,7 @@
             rotation4D: 0,  // 4D rotation angle (YW plane)
             speed: 0.5,
             sensitivity: 0.002,
-            rotationSpeed: 0.1  // 4D rotation speed
+            rotationSpeed: 2.5 * Math.PI / 180  // 4D rotation speed: 2.5 degrees
         };
 
         const keys = {};
@@ -773,8 +860,6 @@
             gl.clearColor(0.02, 0.02, 0.05, 1);
             gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
             gl.enable(gl.DEPTH_TEST);
-            gl.enable(gl.BLEND);
-            gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
 
             gl.useProgram(program);
 
@@ -808,6 +893,9 @@
                 model = model.multiply(Mat4.rotationY(obj.rotation));
 
                 gl.uniformMatrix4fv(uniforms.modelMatrix, false, model.m);
+                
+                // Pass object's W position for cross-section visibility
+                gl.uniform1f(uniforms.objectW, obj.position.w);
 
                 // Bind buffers
                 gl.bindBuffer(gl.ARRAY_BUFFER, obj.posBuffer);
@@ -825,6 +913,10 @@
                 // Draw
                 if (obj.isPoints) {
                     gl.drawArrays(gl.POINTS, 0, obj.indexCount);
+                } else if (obj.isLines) {
+                    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, obj.indexBuffer);
+                    gl.lineWidth(3);
+                    gl.drawElements(gl.LINES, obj.indexCount, gl.UNSIGNED_SHORT, 0);
                 } else if (obj.indexBuffer) {
                     gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, obj.indexBuffer);
                     gl.drawElements(gl.TRIANGLES, obj.indexCount, gl.UNSIGNED_SHORT, 0);
@@ -833,10 +925,123 @@
                 }
             }
 
+            // Draw axes (always visible at origin)
+            gl.disable(gl.DEPTH_TEST);
+            drawObject(axesObject);
+            gl.enable(gl.DEPTH_TEST);
+
             // Draw each object
             for (const obj of objects) {
                 drawObject(obj);
             }
+        }
+
+        // W Axis Indicator Drawing
+        const wCanvas = document.getElementById('w-canvas');
+        const wCtx = wCanvas.getContext('2d');
+
+        function drawWIndicator() {
+            const w = wCanvas.width;
+            const h = wCanvas.height;
+            const cx = w / 2;
+            const cy = h / 2;
+            const radius = 40;
+
+            // Clear
+            wCtx.clearRect(0, 0, w, h);
+
+            // Draw background circle
+            wCtx.beginPath();
+            wCtx.arc(cx, cy, radius + 8, 0, Math.PI * 2);
+            wCtx.fillStyle = 'rgba(30, 30, 40, 0.9)';
+            wCtx.fill();
+            wCtx.strokeStyle = 'rgba(100, 100, 120, 0.5)';
+            wCtx.lineWidth = 1;
+            wCtx.stroke();
+
+            // Helper to draw an axis
+            function drawAxis(x1, y1, x2, y2, color, label, labelOffset) {
+                // Draw axis line
+                wCtx.beginPath();
+                wCtx.moveTo(x1, y1);
+                wCtx.lineTo(x2, y2);
+                wCtx.strokeStyle = color;
+                wCtx.lineWidth = 2;
+                wCtx.stroke();
+
+                // Draw arrowhead
+                const angle = Math.atan2(y2 - y1, x2 - x1);
+                const arrowSize = 6;
+                wCtx.beginPath();
+                wCtx.moveTo(x2, y2);
+                wCtx.lineTo(x2 - arrowSize * Math.cos(angle - 0.4), y2 - arrowSize * Math.sin(angle - 0.4));
+                wCtx.moveTo(x2, y2);
+                wCtx.lineTo(x2 - arrowSize * Math.cos(angle + 0.4), y2 - arrowSize * Math.sin(angle + 0.4));
+                wCtx.stroke();
+
+                // Draw label
+                wCtx.font = 'bold 10px Courier New';
+                wCtx.fillStyle = color;
+                wCtx.textAlign = 'center';
+                wCtx.fillText(label, x2 + labelOffset.x, y2 + labelOffset.y);
+            }
+
+            // Camera rotation (yaw and pitch)
+            const yaw = camera.yaw + Math.PI / 2; // Offset to match forward direction
+            const pitch = camera.pitch;
+
+            // Project a 3D direction onto 2D (simplified isometric-like projection)
+            function project3D(x, y, z) {
+                // Rotate by yaw (around Y)
+                const cosYaw = Math.cos(yaw);
+                const sinYaw = Math.sin(yaw);
+                const rx = x * cosYaw - z * sinYaw;
+                const rz = x * sinYaw + z * cosYaw;
+
+                // Rotate by pitch (around X)
+                const cosPitch = Math.cos(pitch);
+                const sinPitch = Math.sin(pitch);
+                const ry = y * cosPitch - rz * sinPitch;
+                const finalZ = y * sinPitch + rz * cosPitch;
+
+                // Project to 2D (orthographic with some perspective)
+                const scale = radius * 0.85;
+                return {
+                    x: rx * scale,
+                    y: -ry * scale // Negative because canvas Y is down
+                };
+            }
+
+            // X axis (red)
+            const xProj = project3D(1, 0, 0);
+            drawAxis(cx, cy, cx + xProj.x, cy + xProj.y, '#ff3333', 'X', {x: xProj.x > 0 ? 10 : -10, y: xProj.y > 0 ? 12 : -6});
+
+            // Y axis (green)
+            const yProj = project3D(0, 1, 0);
+            drawAxis(cx, cy, cx + yProj.x, cy + yProj.y, '#33ff33', 'Y', {x: yProj.x > 0 ? 10 : -10, y: yProj.y > 0 ? 12 : -6});
+
+            // Z axis (blue)
+            const zProj = project3D(0, 0, 1);
+            drawAxis(cx, cy, cx + zProj.x, cy + zProj.y, '#3333ff', 'Z', {x: zProj.x > 0 ? 10 : -10, y: zProj.y > 0 ? 12 : -6});
+
+            // W axis (yellow) - rotates based on 4D rotation in YW plane
+            const rotAngle = camera.rotation4D;
+            // W rotates in the YW plane, so it's a combination of Y and W
+            const wProj = project3D(0, Math.cos(rotAngle), Math.sin(rotAngle));
+            drawAxis(cx, cy, cx + wProj.x, cy + wProj.y, '#ffff00', 'W', {x: wProj.x > 0 ? 10 : -10, y: wProj.y > 0 ? 12 : -6});
+
+            // Draw current W position as a dot on the W axis
+            const wNorm = Math.max(-1, Math.min(1, camera.position.w / 5));
+            const dotX = cx + wProj.x * wNorm * 0.9;
+            const dotY = cy + wProj.y * wNorm * 0.9;
+
+            wCtx.beginPath();
+            wCtx.arc(dotX, dotY, 4, 0, Math.PI * 2);
+            wCtx.fillStyle = '#ffff00';
+            wCtx.fill();
+            wCtx.strokeStyle = '#ffffff';
+            wCtx.lineWidth = 1;
+            wCtx.stroke();
         }
 
         function updateUI() {
@@ -844,6 +1049,7 @@
                 `${camera.position.x.toFixed(2)}, ${camera.position.y.toFixed(2)}, ${camera.position.z.toFixed(2)}`;
             document.getElementById('wpos').textContent = camera.position.w.toFixed(2);
             document.getElementById('rot4d').textContent = (camera.rotation4D * 180 / Math.PI).toFixed(1);
+            drawWIndicator();
         }
 
         function gameLoop(time) {
