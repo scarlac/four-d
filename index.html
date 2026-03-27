@@ -1,0 +1,878 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>4D First-Person Explorer</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            background: #000;
+            overflow: hidden;
+            font-family: 'Courier New', monospace;
+        }
+
+        canvas {
+            display: block;
+        }
+
+        #ui {
+            position: fixed;
+            top: 20px;
+            left: 20px;
+            color: #0f0;
+            font-size: 14px;
+            text-shadow: 0 0 5px #0f0;
+            pointer-events: none;
+            z-index: 100;
+        }
+
+        #crosshair {
+            position: fixed;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            width: 20px;
+            height: 20px;
+            pointer-events: none;
+            z-index: 100;
+        }
+
+        #crosshair::before,
+        #crosshair::after {
+            content: '';
+            position: absolute;
+            background: rgba(255, 255, 255, 0.7);
+        }
+
+        #crosshair::before {
+            width: 2px;
+            height: 20px;
+            left: 9px;
+        }
+
+        #crosshair::after {
+            width: 20px;
+            height: 2px;
+            top: 9px;
+        }
+
+        #hint {
+            position: fixed;
+            bottom: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            color: #888;
+            font-size: 12px;
+            pointer-events: none;
+        }
+    </style>
+</head>
+
+<body>
+    <canvas id="canvas"></canvas>
+    <div id="ui">
+        <div>Position: <span id="pos">0.00, 0.00, 0.00</span></div>
+        <div>W: <span id="wpos">0.00</span></div>
+        <div>4D Rotation: <span id="rot4d">0.00</span>°</div>
+        <div>FPS: <span id="fps">0</span></div>
+    </div>
+    <div id="crosshair"></div>
+    <div id="hint">Click to capture mouse | WASD: Move | Space/CTRL: Up/Down | Q/E: W-Move | Shift+Q/E: W-Rotate | R:
+        Reset</div>
+
+    <!-- Vertex Shader: 4D to 2D projection -->
+    <script id="vs" type="x-shader/x-vertex">
+        attribute vec3 aPosition;
+        attribute vec3 aNormal;
+        attribute vec3 aColor;
+        
+        uniform mat4 uProjection;
+        uniform mat4 uView;
+        uniform vec4 uCameraPos;
+        uniform mat4 uModelMatrix;
+        uniform float uRotation4D;  // 4D rotation angle
+        
+        varying vec3 vColor;
+        varying vec3 vNormal;
+        varying float vWDist;
+        
+        // 4D rotation in YW plane
+        vec4 rotate4D_YW(vec4 p, float angle) {
+            float c = cos(angle);
+            float s = sin(angle);
+            return vec4(
+                p.x,
+                p.y * c - p.w * s,
+                p.z,
+                p.y * s + p.w * c
+            );
+        }
+        
+        void main() {
+            vec4 worldPos = uModelMatrix * vec4(aPosition, 1.0);
+            
+            // 4D to 3D perspective projection with cross-section
+            vec4 camRel = worldPos - uCameraPos;
+            
+            // Apply 4D rotation (rotates the view into the 4th dimension)
+            camRel = rotate4D_YW(camRel, uRotation4D);
+            
+            // W distance for cross-section visibility
+            float wDist = abs(camRel.w);
+            vWDist = wDist;
+            
+            // Cross-section threshold - objects outside this band are invisible
+            float wThreshold = 2.0;
+            
+            // If too far in W, clip the vertex (move outside clip space)
+            if (wDist > wThreshold) {
+                gl_Position = vec4(0.0, 0.0, 2.0, 1.0); // Outside clip space
+                return;
+            }
+            
+            // Proper 4D perspective: scale based on W distance from camera
+            // fw is the focal length in 4D (distance to projection hyperplane)
+            float fw = 3.0;
+            float rw = camRel.w;
+            
+            // Prevent division by zero and handle being "past" the focal plane
+            float wFactor = fw / max(fw - rw, 0.1);
+            
+            vec3 projectedPos = camRel.xyz * wFactor;
+            
+            // Transform to clip space
+            vec4 viewPos = uView * vec4(projectedPos, 1.0);
+            gl_Position = uProjection * viewPos;
+            
+            vColor = aColor;
+            vNormal = mat3(uModelMatrix) * aNormal;
+            
+            // Scale point size based on depth
+            gl_PointSize = max(2.0, 8.0 / (-viewPos.z * 0.1));
+        }
+    </script>
+
+    <!-- Fragment Shader: Simple lighting with cross-section fade -->
+    <script id="fs" type="x-shader/x-fragment">
+        precision mediump float;
+        
+        varying vec3 vColor;
+        varying vec3 vNormal;
+        varying float vWDist;
+        
+        void main() {
+            // Cross-section fade: objects fade as they approach the W threshold
+            float wThreshold = 2.0;
+            float fadeStart = 1.5;
+            float alpha = 1.0 - smoothstep(fadeStart, wThreshold, vWDist);
+            
+            vec3 normal = normalize(vNormal);
+            vec3 lightDir = normalize(vec3(0.5, 1.0, 0.8));
+            
+            float diff = max(dot(normal, lightDir), 0.0);
+            float ambient = 0.3;
+            
+            vec3 finalColor = vColor * (ambient + diff * 0.7);
+            gl_FragColor = vec4(finalColor, alpha);
+        }
+    </script>
+
+    <script>
+        // ============================================
+        // 4D MATH LIBRARY
+        // ============================================
+
+        class Vec4 {
+            constructor(x = 0, y = 0, z = 0, w = 0) {
+                this.x = x; this.y = y; this.z = z; this.w = w;
+            }
+
+            clone() { return new Vec4(this.x, this.y, this.z, this.w); }
+
+            add(v) { return new Vec4(this.x + v.x, this.y + v.y, this.z + v.z, this.w + v.w); }
+            sub(v) { return new Vec4(this.x - v.x, this.y - v.y, this.z - v.z, this.w - v.w); }
+            scale(s) { return new Vec4(this.x * s, this.y * s, this.z * s, this.w * s); }
+
+            dot(v) { return this.x * v.x + this.y * v.y + this.z * v.z + this.w * v.w; }
+
+            length() { return Math.sqrt(this.x * this.x + this.y * this.y + this.z * this.z + this.w * this.w); }
+
+            normalize() {
+                const len = this.length();
+                if (len === 0) return new Vec4();
+                return this.scale(1 / len);
+            }
+
+            toArray() { return [this.x, this.y, this.z, this.w]; }
+        }
+
+        class Mat4 {
+            constructor() {
+                this.m = new Float32Array(16);
+                this.identity();
+            }
+
+            identity() {
+                this.m.fill(0);
+                this.m[0] = this.m[5] = this.m[10] = this.m[15] = 1;
+                return this;
+            }
+
+            static perspective(fov, aspect, near, far) {
+                const mat = new Mat4();
+                const f = 1.0 / Math.tan(fov / 2);
+                const nf = 1 / (near - far);
+
+                mat.m[0] = f / aspect;
+                mat.m[5] = f;
+                mat.m[10] = (far + near) * nf;
+                mat.m[11] = -1;
+                mat.m[14] = 2 * far * near * nf;
+                mat.m[15] = 0;
+
+                return mat;
+            }
+
+            static lookAt(eye, target, up) {
+                const mat = new Mat4();
+
+                const zAxis = eye.sub(target).normalize();
+                const xAxis = cross(up, zAxis).normalize();
+                const yAxis = cross(zAxis, xAxis);
+
+                mat.m[0] = xAxis.x; mat.m[4] = xAxis.y; mat.m[8] = xAxis.z;
+                mat.m[1] = yAxis.x; mat.m[5] = yAxis.y; mat.m[9] = yAxis.z;
+                mat.m[2] = zAxis.x; mat.m[6] = zAxis.y; mat.m[10] = zAxis.z;
+
+                mat.m[12] = -xAxis.dot(eye);
+                mat.m[13] = -yAxis.dot(eye);
+                mat.m[14] = -zAxis.dot(eye);
+                mat.m[15] = 1;
+
+                return mat;
+            }
+
+            static translation(x, y, z) {
+                const mat = new Mat4();
+                mat.m[12] = x; mat.m[13] = y; mat.m[14] = z;
+                return mat;
+            }
+
+            static rotationY(angle) {
+                const mat = new Mat4();
+                const c = Math.cos(angle), s = Math.sin(angle);
+                mat.m[0] = c; mat.m[8] = s;
+                mat.m[2] = -s; mat.m[10] = c;
+                return mat;
+            }
+
+            static rotationX(angle) {
+                const mat = new Mat4();
+                const c = Math.cos(angle), s = Math.sin(angle);
+                mat.m[5] = c; mat.m[9] = -s;
+                mat.m[6] = s; mat.m[10] = c;
+                return mat;
+            }
+
+            multiply(other) {
+                const result = new Mat4();
+                const a = this.m, b = other.m, r = result.m;
+
+                for (let i = 0; i < 4; i++) {
+                    for (let j = 0; j < 4; j++) {
+                        r[i * 4 + j] =
+                            a[i * 4 + 0] * b[0 * 4 + j] +
+                            a[i * 4 + 1] * b[1 * 4 + j] +
+                            a[i * 4 + 2] * b[2 * 4 + j] +
+                            a[i * 4 + 3] * b[3 * 4 + j];
+                    }
+                }
+                return result;
+            }
+        }
+
+        function cross(a, b) {
+            return new Vec4(
+                a.y * b.z - a.z * b.y,
+                a.z * b.x - a.x * b.z,
+                a.x * b.y - a.y * b.x,
+                0
+            );
+        }
+
+        // ============================================
+        // GEOMETRY GENERATORS
+        // ============================================
+
+        function createCube(size, color) {
+            const s = size / 2;
+            const positions = [];
+            const normals = [];
+            const colors = [];
+            const indices = [];
+
+            // Each face
+            const faces = [
+                { n: [0, 0, 1], verts: [[-s, -s, s], [s, -s, s], [s, s, s], [-s, s, s]] },
+                { n: [0, 0, -1], verts: [[s, -s, -s], [-s, -s, -s], [-s, s, -s], [s, s, -s]] },
+                { n: [0, 1, 0], verts: [[-s, s, s], [s, s, s], [s, s, -s], [-s, s, -s]] },
+                { n: [0, -1, 0], verts: [[-s, -s, -s], [s, -s, -s], [s, -s, s], [-s, -s, s]] },
+                { n: [1, 0, 0], verts: [[s, -s, s], [s, -s, -s], [s, s, -s], [s, s, s]] },
+                { n: [-1, 0, 0], verts: [[-s, -s, -s], [-s, -s, s], [-s, s, s], [-s, s, -s]] },
+            ];
+
+            let idx = 0;
+            for (const face of faces) {
+                for (const v of face.verts) {
+                    positions.push(...v);
+                    normals.push(...face.n);
+                    colors.push(...color);
+                }
+                indices.push(idx, idx + 1, idx + 2, idx, idx + 2, idx + 3);
+                idx += 4;
+            }
+
+            return { positions, normals, colors, indices };
+        }
+
+        function createSphere(radius, segments, color) {
+            const positions = [];
+            const normals = [];
+            const colors = [];
+            const indices = [];
+
+            for (let lat = 0; lat <= segments; lat++) {
+                const theta = lat * Math.PI / segments;
+                const sinTheta = Math.sin(theta);
+                const cosTheta = Math.cos(theta);
+
+                for (let lon = 0; lon <= segments; lon++) {
+                    const phi = lon * 2 * Math.PI / segments;
+                    const sinPhi = Math.sin(phi);
+                    const cosPhi = Math.cos(phi);
+
+                    const x = cosPhi * sinTheta;
+                    const y = cosTheta;
+                    const z = sinPhi * sinTheta;
+
+                    positions.push(radius * x, radius * y, radius * z);
+                    normals.push(x, y, z);
+                    colors.push(...color);
+                }
+            }
+
+            for (let lat = 0; lat < segments; lat++) {
+                for (let lon = 0; lon < segments; lon++) {
+                    const first = lat * (segments + 1) + lon;
+                    const second = first + segments + 1;
+
+                    indices.push(first, second, first + 1);
+                    indices.push(second, second + 1, first + 1);
+                }
+            }
+
+            return { positions, normals, colors, indices };
+        }
+
+        function createPyramid(size, color) {
+            const positions = [];
+            const normals = [];
+            const colors = [];
+            const indices = [];
+
+            const h = size * 1.2;
+            const s = size / 2;
+
+            // Base
+            const baseVerts = [[-s, 0, -s], [s, 0, -s], [s, 0, s], [-s, 0, s]];
+            for (const v of baseVerts) {
+                positions.push(...v);
+                normals.push(0, -1, 0);
+                colors.push(...color);
+            }
+            indices.push(0, 2, 1, 0, 3, 2);
+
+            // Apex
+            const apex = [0, h, 0];
+            const sides = [
+                [baseVerts[0], baseVerts[1], apex],
+                [baseVerts[1], baseVerts[2], apex],
+                [baseVerts[2], baseVerts[3], apex],
+                [baseVerts[3], baseVerts[0], apex],
+            ];
+
+            let idx = 4;
+            for (const side of sides) {
+                const v0 = side[0], v1 = side[1], v2 = side[2];
+
+                // Calculate normal
+                const edge1 = [v1[0] - v0[0], v1[1] - v0[1], v1[2] - v0[2]];
+                const edge2 = [v2[0] - v0[0], v2[1] - v0[1], v2[2] - v0[2]];
+                const n = [
+                    edge1[1] * edge2[2] - edge1[2] * edge2[1],
+                    edge1[2] * edge2[0] - edge1[0] * edge2[2],
+                    edge1[0] * edge2[1] - edge1[1] * edge2[0]
+                ];
+                const len = Math.sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+                n[0] /= len; n[1] /= len; n[2] /= len;
+
+                for (const v of side) {
+                    positions.push(...v);
+                    normals.push(...n);
+                    colors.push(...color);
+                }
+                indices.push(idx, idx + 1, idx + 2);
+                idx += 3;
+            }
+
+            return { positions, normals, colors, indices };
+        }
+
+        function createPoints(count, spread, color) {
+            const positions = [];
+            const normals = [];
+            const colors = [];
+
+            for (let i = 0; i < count; i++) {
+                positions.push(
+                    (Math.random() - 0.5) * spread,
+                    (Math.random() - 0.5) * spread,
+                    (Math.random() - 0.5) * spread
+                );
+                normals.push(0, 1, 0);
+                colors.push(...color.map(c => c * (0.5 + Math.random() * 0.5)));
+            }
+
+            return { positions, normals, colors, indices: null, isPoints: true, count };
+        }
+
+        // ============================================
+        // WEBGL SETUP
+        // ============================================
+
+        const canvas = document.getElementById('canvas');
+        const gl = canvas.getContext('webgl', { antialias: true });
+
+        if (!gl) {
+            alert('WebGL not supported!');
+            throw new Error('WebGL not supported');
+        }
+
+        function createShader(type, source) {
+            const shader = gl.createShader(type);
+            gl.shaderSource(shader, source);
+            gl.compileShader(shader);
+
+            if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+                console.error('Shader compile error:', gl.getShaderInfoLog(shader));
+                gl.deleteShader(shader);
+                return null;
+            }
+            return shader;
+        }
+
+        function createProgram(vsSource, fsSource) {
+            const vs = createShader(gl.VERTEX_SHADER, vsSource);
+            const fs = createShader(gl.FRAGMENT_SHADER, fsSource);
+
+            const program = gl.createProgram();
+            gl.attachShader(program, vs);
+            gl.attachShader(program, fs);
+            gl.linkProgram(program);
+
+            if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+                console.error('Program link error:', gl.getProgramInfoLog(program));
+                return null;
+            }
+            return program;
+        }
+
+        const vsSource = document.getElementById('vs').textContent;
+        const fsSource = document.getElementById('fs').textContent;
+        const program = createProgram(vsSource, fsSource);
+
+        if (!program) {
+            throw new Error('Failed to create shader program');
+        }
+
+        // Get attribute and uniform locations
+        const attribs = {
+            position: gl.getAttribLocation(program, 'aPosition'),
+            normal: gl.getAttribLocation(program, 'aNormal'),
+            color: gl.getAttribLocation(program, 'aColor'),
+        };
+
+        const uniforms = {
+            projection: gl.getUniformLocation(program, 'uProjection'),
+            view: gl.getUniformLocation(program, 'uView'),
+            cameraPos: gl.getUniformLocation(program, 'uCameraPos'),
+            modelMatrix: gl.getUniformLocation(program, 'uModelMatrix'),
+            rotation4D: gl.getUniformLocation(program, 'uRotation4D'),
+        };
+
+        // ============================================
+        // SCENE SETUP
+        // ============================================
+
+        const objects = [];
+        const OBJECT_COUNT = 200;
+        const W_SNAP_THRESHOLD = 0.1;
+        const W_MOVE_SPEED = 0.3;
+        const SPREAD = 150;  // Size of the area objects are spread over
+
+        const colors = [
+            [1, 0.2, 0.2],  // Red
+            [0.2, 1, 0.2],  // Green
+            [0.2, 0.2, 1],  // Blue
+            [1, 1, 0.2],    // Yellow
+            [1, 0.2, 1],    // Magenta
+            [0.2, 1, 1],    // Cyan
+            [1, 0.5, 0.2],  // Orange
+            [0.5, 0.2, 1],  // Purple
+            [1, 1, 1],      // White
+            [0.8, 0.8, 0.8], // Gray
+        ];
+
+        // Create random objects on the floor (Z=0)
+        for (let i = 0; i < OBJECT_COUNT; i++) {
+            const type = Math.floor(Math.random() * 4);
+            const color = colors[i % colors.length];
+
+            let size = 0.5 + Math.random() * 1.5;
+
+            const pos = new Vec4(
+                (Math.random() - 0.5) * SPREAD,
+                size / 2,  // Sit on floor
+                (Math.random() - 0.5) * SPREAD,
+                0  // All objects at W=0
+            );
+
+            let geometry;
+
+            switch (type) {
+                case 0: // Cube
+                    geometry = createCube(size, color);
+                    break;
+                case 1: // Sphere
+                    geometry = createSphere(size * 0.6, 12, color);
+                    break;
+                case 2: // Pyramid
+                    geometry = createPyramid(size, color);
+                    break;
+                case 3: // Points
+                    geometry = createPoints(50, size * 2, color);
+                    break;
+            }
+
+            // Create WebGL buffers
+            const posBuffer = gl.createBuffer();
+            gl.bindBuffer(gl.ARRAY_BUFFER, posBuffer);
+            gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(geometry.positions), gl.STATIC_DRAW);
+
+            const normBuffer = gl.createBuffer();
+            gl.bindBuffer(gl.ARRAY_BUFFER, normBuffer);
+            gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(geometry.normals), gl.STATIC_DRAW);
+
+            const colorBuffer = gl.createBuffer();
+            gl.bindBuffer(gl.ARRAY_BUFFER, colorBuffer);
+            gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(geometry.colors), gl.STATIC_DRAW);
+
+            let indexBuffer = null;
+            let indexCount = 0;
+            let isPoints = false;
+
+            if (geometry.indices) {
+                indexBuffer = gl.createBuffer();
+                gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, indexBuffer);
+                gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array(geometry.indices), gl.STATIC_DRAW);
+                indexCount = geometry.indices.length;
+            } else if (geometry.isPoints) {
+                isPoints = true;
+                indexCount = geometry.count;
+            }
+
+            objects.push({
+                position: pos,
+                rotation: Math.random() * Math.PI * 2,
+                posBuffer,
+                normBuffer,
+                colorBuffer,
+                indexBuffer,
+                indexCount,
+                isPoints
+            });
+        }
+
+        // Create large magenta box (room)
+        const boxSize = 160;
+        const boxColor = [1, 0.2, 1]; // Magenta
+        const boxGeometry = createCube(boxSize, boxColor);
+
+        const boxPosBuffer = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, boxPosBuffer);
+        gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(boxGeometry.positions), gl.STATIC_DRAW);
+
+        const boxNormBuffer = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, boxNormBuffer);
+        gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(boxGeometry.normals), gl.STATIC_DRAW);
+
+        const boxColorBuffer = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, boxColorBuffer);
+        gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(boxGeometry.colors), gl.STATIC_DRAW);
+
+        const boxIndexBuffer = gl.createBuffer();
+        gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, boxIndexBuffer);
+        gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array(boxGeometry.indices), gl.STATIC_DRAW);
+
+        const boxObject = {
+            position: new Vec4(0, 0, 0, 0),
+            rotation: 0,
+            posBuffer: boxPosBuffer,
+            normBuffer: boxNormBuffer,
+            colorBuffer: boxColorBuffer,
+            indexBuffer: boxIndexBuffer,
+            indexCount: boxGeometry.indices.length,
+            isPoints: false,
+            isBox: true
+        };
+
+        // ============================================
+        // CAMERA & INPUT
+        // ============================================
+
+        const camera = {
+            position: new Vec4(0, 5, 10, 0),
+            yaw: -Math.PI / 2,
+            pitch: 0,
+            rotation4D: 0,  // 4D rotation angle (YW plane)
+            speed: 0.5,
+            sensitivity: 0.002,
+            rotationSpeed: 0.1  // 4D rotation speed
+        };
+
+        const keys = {};
+        const keysPressed = {}; // For single-press actions
+        let shiftHeld = false;
+
+        document.addEventListener('keydown', (e) => {
+            // Prevent Space from scrolling and CTRL from triggering browser shortcuts
+            if (e.key === ' ' || e.key === 'Control') {
+                e.preventDefault();
+            }
+            if (e.key === 'Shift') {
+                shiftHeld = true;
+                return;
+            }
+            keys[e.key.toLowerCase()] = true;
+            keysPressed[e.key.toLowerCase()] = true;
+        });
+
+        document.addEventListener('keyup', (e) => {
+            if (e.key === 'Shift') {
+                shiftHeld = false;
+                return;
+            }
+            keys[e.key.toLowerCase()] = false;
+        });
+
+        // Mouse capture
+        canvas.addEventListener('click', () => {
+            canvas.requestPointerLock();
+        });
+
+        document.addEventListener('pointerlockchange', () => {
+            if (document.pointerLockElement === canvas) {
+                document.addEventListener('mousemove', onMouseMove);
+            } else {
+                document.removeEventListener('mousemove', onMouseMove);
+            }
+        });
+
+        function onMouseMove(e) {
+            camera.yaw += e.movementX * camera.sensitivity;
+            camera.pitch -= e.movementY * camera.sensitivity;
+
+            // Clamp pitch
+            camera.pitch = Math.max(-Math.PI / 2 + 0.01, Math.min(Math.PI / 2 - 0.01, camera.pitch));
+        }
+
+        // ============================================
+        // GAME LOOP
+        // ============================================
+
+        let lastTime = performance.now();
+        let frameCount = 0;
+        let fpsTime = 0;
+
+        function resize() {
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+            gl.viewport(0, 0, canvas.width, canvas.height);
+        }
+
+        window.addEventListener('resize', resize);
+        resize();
+
+        function update(dt) {
+            // Movement
+            const forward = new Vec4(
+                Math.cos(camera.yaw),
+                0,
+                Math.sin(camera.yaw),
+                0
+            );
+            const right = new Vec4(
+                Math.cos(camera.yaw + Math.PI / 2),
+                0,
+                Math.sin(camera.yaw + Math.PI / 2),
+                0
+            );
+
+            if (keys['w']) camera.position = camera.position.add(forward.scale(camera.speed));
+            if (keys['s']) camera.position = camera.position.sub(forward.scale(camera.speed));
+            if (keys['a']) camera.position = camera.position.sub(right.scale(camera.speed));
+            if (keys['d']) camera.position = camera.position.add(right.scale(camera.speed));
+
+            // Vertical movement in 3D: Space = up, CTRL = down
+            if (keys[' ']) camera.position.y += camera.speed;
+            if (keys['control']) camera.position.y -= camera.speed;
+
+            // 4D movement: E = ascend in W, Q = descend in W (hold for continuous)
+            if (keys['e'] && !shiftHeld) camera.position.w += W_MOVE_SPEED;
+            if (keys['q'] && !shiftHeld) camera.position.w -= W_MOVE_SPEED;
+
+            // 4D rotation: Shift+E = positive, Shift+Q = negative (single press)
+            if (keysPressed['e'] && shiftHeld) {
+                camera.rotation4D += camera.rotationSpeed;
+            }
+            if (keysPressed['q'] && shiftHeld) {
+                camera.rotation4D -= camera.rotationSpeed;
+            }
+            if (keysPressed['r']) {
+                camera.position.w = 0;
+                camera.rotation4D = 0;  // Reset 4D rotation too
+            }
+
+            // Snap to 0 when close
+            if (Math.abs(camera.position.w) < W_SNAP_THRESHOLD) {
+                camera.position.w = 0;
+            }
+
+            // Clear pressed keys
+            for (const k in keysPressed) keysPressed[k] = false;
+        }
+
+        function render() {
+            gl.clearColor(0.02, 0.02, 0.05, 1);
+            gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+            gl.enable(gl.DEPTH_TEST);
+            gl.enable(gl.BLEND);
+            gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+
+            gl.useProgram(program);
+
+            // Matrices
+            const aspect = canvas.width / canvas.height;
+            const projection = Mat4.perspective(Math.PI / 3, aspect, 0.1, 1000);
+
+            // View matrix from camera
+            const lookDir = new Vec4(
+                Math.cos(camera.yaw) * Math.cos(camera.pitch),
+                Math.sin(camera.pitch),
+                Math.sin(camera.yaw) * Math.cos(camera.pitch),
+                0
+            );
+            const target = camera.position.add(lookDir);
+            const view = Mat4.lookAt(camera.position, target, new Vec4(0, 1, 0, 0));
+
+            gl.uniformMatrix4fv(uniforms.projection, false, projection.m);
+            gl.uniformMatrix4fv(uniforms.view, false, view.m);
+
+            // Camera position as Vec4 for 4D projection
+            gl.uniform4f(uniforms.cameraPos, camera.position.x, camera.position.y, camera.position.z, camera.position.w);
+
+            // 4D rotation angle
+            gl.uniform1f(uniforms.rotation4D, camera.rotation4D);
+
+            // Helper function to draw an object
+            function drawObject(obj) {
+                // Model matrix: translate to position and rotate
+                let model = Mat4.translation(obj.position.x, obj.position.y, obj.position.z);
+                model = model.multiply(Mat4.rotationY(obj.rotation));
+
+                gl.uniformMatrix4fv(uniforms.modelMatrix, false, model.m);
+
+                // Bind buffers
+                gl.bindBuffer(gl.ARRAY_BUFFER, obj.posBuffer);
+                gl.enableVertexAttribArray(attribs.position);
+                gl.vertexAttribPointer(attribs.position, 3, gl.FLOAT, false, 0, 0);
+
+                gl.bindBuffer(gl.ARRAY_BUFFER, obj.normBuffer);
+                gl.enableVertexAttribArray(attribs.normal);
+                gl.vertexAttribPointer(attribs.normal, 3, gl.FLOAT, false, 0, 0);
+
+                gl.bindBuffer(gl.ARRAY_BUFFER, obj.colorBuffer);
+                gl.enableVertexAttribArray(attribs.color);
+                gl.vertexAttribPointer(attribs.color, 3, gl.FLOAT, false, 0, 0);
+
+                // Draw
+                if (obj.isPoints) {
+                    gl.drawArrays(gl.POINTS, 0, obj.indexCount);
+                } else if (obj.indexBuffer) {
+                    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, obj.indexBuffer);
+                    gl.drawElements(gl.TRIANGLES, obj.indexCount, gl.UNSIGNED_SHORT, 0);
+                } else {
+                    gl.drawArrays(gl.TRIANGLES, 0, obj.indexCount);
+                }
+            }
+
+            // Draw each object
+            for (const obj of objects) {
+                drawObject(obj);
+            }
+        }
+
+        function updateUI() {
+            document.getElementById('pos').textContent =
+                `${camera.position.x.toFixed(2)}, ${camera.position.y.toFixed(2)}, ${camera.position.z.toFixed(2)}`;
+            document.getElementById('wpos').textContent = camera.position.w.toFixed(2);
+            document.getElementById('rot4d').textContent = (camera.rotation4D * 180 / Math.PI).toFixed(1);
+        }
+
+        function gameLoop(time) {
+            const dt = (time - lastTime) / 1000;
+            lastTime = time;
+
+            // FPS counter
+            frameCount++;
+            fpsTime += dt;
+            if (fpsTime >= 1) {
+                document.getElementById('fps').textContent = frameCount;
+                frameCount = 0;
+                fpsTime = 0;
+            }
+
+            update(dt);
+            render();
+            updateUI();
+
+            requestAnimationFrame(gameLoop);
+        }
+
+        // Start
+        requestAnimationFrame(gameLoop);
+
+        console.log('4D First-Person Explorer initialized');
+        console.log('Click canvas to capture mouse');
+        console.log('WASD: Move | E/Q: Ascend/Descend W | R: Reset W');
+    </script>
+</body>
+
+</html>
